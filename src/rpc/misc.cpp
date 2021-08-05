@@ -3,6 +3,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <core_io.h>
 #include <httpserver.h>
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
@@ -12,6 +13,8 @@
 #include <interfaces/init.h>
 #include <interfaces/ipc.h>
 #include <key_io.h>
+#include <netbase.h>
+#include <net.h>
 #include <node/context.h>
 #include <outputtype.h>
 #include <rpc/blockchain.h>
@@ -19,10 +22,16 @@
 #include <rpc/util.h>
 #include <scheduler.h>
 #include <script/descriptor.h>
+#include <timedata.h>
 #include <util/check.h>
 #include <util/message.h> // For MessageSign(), MessageVerify()
 #include <util/strencodings.h>
 #include <util/system.h>
+#include <util/translation.h>
+#include <validation.h>
+#include <wallet/rpcwallet.h>
+#include <wallet/wallet.h>
+#include <warnings.h>
 
 #include <stdint.h>
 #include <tuple>
