@@ -1446,6 +1446,12 @@ RPCHelpMan getblockchaininfo()
                         {RPCResult::Type::NUM, "blocks", "the height of the most-work fully-validated chain. The genesis block has height 0"},
                         {RPCResult::Type::NUM, "headers", "the current number of headers we have validated"},
                         {RPCResult::Type::STR, "bestblockhash", "the hash of the currently best block"},
+                        {RPCResult::Type::STR, "notarizedhash", "the hash of the currently best notarized block"},
+                        {RPCResult::Type::STR, "notarizedtxid", "notarizedtxid"},
+                        {RPCResult::Type::NUM, "prevMoMheight", "prevMoMheight"},
+                        {RPCResult::Type::NUM, "notarized_MoMdepth", "notarized_MoMdepth"},
+                        {RPCResult::Type::STR, "notarized_MoM", "notarized_MoM"},
+                        {RPCResult::Type::NUM, "notarized", "the height of the currently best notarized block"},
                         {RPCResult::Type::NUM, "difficulty", "the current difficulty"},
                         {RPCResult::Type::NUM, "mediantime", "median time for the current best block"},
                         {RPCResult::Type::NUM, "verificationprogress", "estimate of verification progress [0..1]"},
@@ -1502,6 +1508,17 @@ RPCHelpMan getblockchaininfo()
     obj.pushKV("blocks",                height);
     obj.pushKV("headers",               pindexBestHeader ? pindexBestHeader->nHeight : -1);
     obj.pushKV("bestblockhash",         tip->GetBlockHash().GetHex());
+    {
+        int32_t komodo_prevMoMheight();
+        extern uint256 NOTARIZED_HASH,NOTARIZED_DESTTXID,NOTARIZED_MOM;
+        extern int32_t NOTARIZED_HEIGHT,NOTARIZED_MOMDEPTH;
+        obj.pushKV("notarizedhash",         NOTARIZED_HASH.GetHex());
+        obj.pushKV("notarizedtxid",         NOTARIZED_DESTTXID.GetHex());
+        obj.pushKV("notarized",                (int)NOTARIZED_HEIGHT);
+        obj.pushKV("prevMoMheight",                (int)komodo_prevMoMheight());
+        obj.pushKV("notarized_MoMdepth",                (int)NOTARIZED_MOMDEPTH);
+        obj.pushKV("notarized_MoM",         NOTARIZED_MOM.GetHex());
+    }
     obj.pushKV("difficulty",            (double)GetDifficulty(tip));
     obj.pushKV("mediantime",            (int64_t)tip->GetMedianTimePast());
     obj.pushKV("verificationprogress",  GuessVerificationProgress(Params().TxData(), tip));
@@ -2749,13 +2766,23 @@ static std::vector<uint256> ComputeMerkleBranch(const std::vector<uint256>& leav
 static RPCHelpMan calc_MoM()
 {
     return RPCHelpMan{"calc_MoM",
-                "\n",
-                {},
+                                "Calculates MoM for a given height and MoMdepth\n",
+                {
+                  {"height", RPCArg::Type::NUM, RPCArg::Optional::NO, "requested height"},
+                  {"MoMdepth", RPCArg::Type::NUM, RPCArg::Optional::NO, "requested depth for MoM"},
+                },
                 RPCResult{
-                    RPCResult::Type::NUM, "", "The current block count"},
+                  RPCResult::Type::OBJ, "", "",
+                  {
+                    {RPCResult::Type::STR, "coin", "active coin for calculation"},
+                    {RPCResult::Type::NUM, "height", "requested block height"},
+                    {RPCResult::Type::NUM, "MoMdepth", "requested MoMdepth"},
+                    {RPCResult::Type::STR_HEX, "MoM", "calculated MoM"},
+                  }
+                },
                 RPCExamples{
-                    HelpExampleCli("getblockcount", "")
-            + HelpExampleRpc("getblockcount", "")
+                    HelpExampleCli("calc_MoM", "100 1")
+            + HelpExampleRpc("calc_MoM", "100, 1")
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -2767,7 +2794,6 @@ static RPCHelpMan calc_MoM()
     MoMdepth = atoi(request.params[1].get_str().c_str());
     if ( height <= 0 || MoMdepth <= 0 || MoMdepth >= height )
         throw std::runtime_error("calc_MoM illegal height or MoMdepth\n");
-    //fprintf(stderr,"height_MoM height.%d\n",height);
     MoM = komodo_calcMoM(height,MoMdepth);
     ret.pushKV("coin",(char *)(ASSETCHAINS_SYMBOL[0] == 0 ? "KMD" : ASSETCHAINS_SYMBOL));
     ret.pushKV("height",height);
@@ -2781,13 +2807,29 @@ static RPCHelpMan calc_MoM()
 static RPCHelpMan height_MoM()
 {
     return RPCHelpMan{"height_MoM",
-                "\n",
-                {},
+                "Calculates MoM for a given height, if it exists\n",
+                {
+                  {"height", RPCArg::Type::NUM, RPCArg::Optional::NO, "height for MoM calculation"},
+                },
                 RPCResult{
-                    RPCResult::Type::NUM, "", "The current block count"},
+                    RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::STR, "coin", "active coin"},
+                        {RPCResult::Type::NUM, "height", "requested block height"},
+                        {RPCResult::Type::NUM, "timestamp", "timestamp"},
+                        {RPCResult::Type::NUM, "depth", "MoMdepth"},
+                        {RPCResult::Type::NUM, "notarized_height", "height of last notarization"},
+                        {RPCResult::Type::STR_HEX, "MoM", "MoM hash"},
+                        {RPCResult::Type::STR_HEX, "kmdtxid", "txid from komodo"},
+                        {RPCResult::Type::STR_HEX, "MoMoM", "MoMoM hash"},
+                        {RPCResult::Type::NUM, "MoMoMoffset", "MoMoffset"},
+                        {RPCResult::Type::NUM, "kmdstarti", "kmdstarti"},
+                        {RPCResult::Type::NUM, "kmdendi", "kmdendi"},
+                    }
+                 },
                 RPCExamples{
-                    HelpExampleCli("getblockcount", "")
-            + HelpExampleRpc("getblockcount", "")
+                    HelpExampleCli("height_MoM", "100")
+            + HelpExampleRpc("height_MoM", "100")
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
