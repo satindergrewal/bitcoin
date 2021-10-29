@@ -19,6 +19,7 @@
 #include <flatfile.h>
 #include <hash.h>
 #include <index/blockfilterindex.h>
+#include <index/disktxpos.h>
 #include <index/txindex.h>
 #include <logging.h>
 #include <logging/timer.h>
@@ -33,6 +34,7 @@
 #include <random.h>
 #include <reverse_iterator.h>
 #include <script/script.h>
+#include <script/standard.h>
 #include <script/sigcache.h>
 #include <shutdown.h>
 #include <signet.h>
@@ -54,12 +56,17 @@
 
 #include <numeric>
 #include <optional>
+
+#include <komodo_validation021.h>
+
 #include <string>
 
 #include <boost/algorithm/string/replace.hpp>
 
 #define MICRO 0.000001
 #define MILLI 0.001
+
+char ASSETCHAINS_SYMBOL[65] = { "CHIPS" };
 
 /**
  * An extra transaction can be added to a package, as long as it only has one
@@ -171,6 +178,7 @@ CBlockIndex* BlockManager::FindForkInGlobalIndex(const CChain& chain, const CBlo
 }
 
 std::unique_ptr<CBlockTreeDB> pblocktree;
+std::unique_ptr<CCoinsViewCache> pcoinsTip;
 
 bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        const CCoinsViewCache& inputs, unsigned int flags, bool cacheSigStore,
@@ -684,8 +692,9 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     }
 
     // Check for non-standard pay-to-script-hash in inputs
-    const bool taproot_active = DeploymentActiveAfter(m_active_chainstate.m_chain.Tip(), args.m_chainparams.GetConsensus(), Consensus::DEPLOYMENT_TAPROOT);
-    if (fRequireStandard && !AreInputsStandard(tx, m_view, taproot_active)) {
+    const auto& params = args.m_chainparams.GetConsensus();
+    auto taproot_state = pindexBestHeader->nHeight >= params.nManualTaprootHeight ? ThresholdState::ACTIVE : ThresholdState::DEFINED;
+    if (fRequireStandard && !AreInputsStandard(tx, m_view, taproot_state == ThresholdState::ACTIVE)) {
         return state.Invalid(TxValidationResult::TX_INPUTS_NOT_STANDARD, "bad-txns-nonstandard-inputs");
     }
 
@@ -1155,8 +1164,68 @@ PackageMempoolAcceptResult ProcessNewPackage(CChainState& active_chainstate, CTx
     return result;
 }
 
+bool GetTransaction(const uint256& hash, CTransactionRef& txOut, const Consensus::Params& consensusParams, uint256& hashBlock, bool fAllowSlow, CBlockIndex* blockIndex)
+{
+    CBlockIndex* pindexSlow = blockIndex;
+
+    LOCK(cs_main);
+
+    if (!blockIndex) {
+        CTransactionRef ptx = g_rpc_node->mempool->get(hash);
+        if (ptx) {
+            txOut = ptx;
+            return true;
+        }
+
+        if (g_txindex) {
+            CDiskTxPos postx;
+            if (g_txindex->ReadTxPos(hash, postx)) {
+                CAutoFile file(OpenBlockFile(postx, true), SER_DISK, CLIENT_VERSION);
+                if (file.IsNull())
+                    return error("%s: OpenBlockFile failed", __func__);
+                CBlockHeader header;
+                try {
+                    file >> header;
+                    fseek(file.Get(), postx.nTxOffset, SEEK_CUR);
+                    file >> txOut;
+                } catch (const std::exception& e) {
+                    return error("%s: Deserialize or I/O error - %s", __func__, e.what());
+                }
+                hashBlock = header.GetHash();
+                if (txOut->GetHash() != hash)
+                    return error("%s: txid mismatch", __func__);
+                return true;
+            }
+
+            // transaction not found in index, nothing more can be done
+            return false;
+        }
+
+        if (fAllowSlow) { // use coin database to locate block that contains transaction, and scan it
+            const Coin& coin = AccessByTxid(*pcoinsTip, hash);
+            if (!coin.IsSpent()) pindexSlow = g_rpc_node->chainman->ActiveChain()[coin.nHeight];
+        }
+    }
+
+    if (pindexSlow) {
+        CBlock block;
+        if (ReadBlockFromDisk(block, pindexSlow, consensusParams)) {
+            for (const auto& tx : block.vtx) {
+                if (tx->GetHash() == hash) {
+                    txOut = tx;
+                    hashBlock = pindexSlow->GetBlockHash();
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
 CTransactionRef GetTransaction(const CBlockIndex* const block_index, const CTxMemPool* const mempool, const uint256& hash, const Consensus::Params& consensusParams, uint256& hashBlock)
 {
+    // TODO: at least partially broken, use bool function above instead
     LOCK(cs_main);
 
     if (block_index) {
@@ -1588,6 +1657,8 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
         }
     }
 
+    komodo_disconnect((CBlockIndex *)pindex,(CBlock *)&block);
+
     // move best block pointer to prevout block
     view.SetBestBlock(pindex->pprev->GetBlockHash());
 
@@ -1670,8 +1741,8 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex* pindex, const Consens
         flags |= SCRIPT_VERIFY_CHECKSEQUENCEVERIFY;
     }
 
-    // Enforce Taproot (BIP340-BIP342)
-    if (DeploymentActiveAt(*pindex, consensusparams, Consensus::DEPLOYMENT_TAPROOT)) {
+    // Start enforcing Taproot using versionbits logic.
+    if (pindexBestHeader->nHeight >= consensusparams.nManualTaprootHeight) {
         flags |= SCRIPT_VERIFY_TAPROOT;
     }
 
@@ -2261,9 +2332,17 @@ bool CChainState::DisconnectTip(BlockValidationState& state, DisconnectedBlockTr
     // Read block from disk.
     std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
     CBlock& block = *pblock;
-    if (!ReadBlockFromDisk(block, pindexDelete, m_params.GetConsensus())) {
+    if (!ReadBlockFromDisk(block, pindexDelete, m_params.GetConsensus()))
         return error("DisconnectTip(): Failed to read block");
+
+    int32_t prevMoMheight; uint256 notarizedhash,txid;
+    komodo_notarized_height(&prevMoMheight,&notarizedhash,&txid);
+    if ( block.GetHash() == notarizedhash )
+    {
+        LogPrintf("DisconnectTip trying to disconnect notarized block at ht.%d\n",(int32_t)pindexDelete->nHeight);
+        return(false);
     }
+
     // Apply the block atomically to the chain state.
     int64_t nStart = GetTimeMicros();
     {
@@ -2412,6 +2491,10 @@ bool CChainState::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew
     LogPrint(BCLog::BENCH, "- Connect block: %.2fms [%.2fs (%.2fms/blk)]\n", (nTime6 - nTime1) * MILLI, nTimeTotal * MICRO, nTimeTotal * MILLI / nBlocksTotal);
 
     connectTrace.BlockConnected(pindexNew, std::move(pthisBlock));
+
+    // komodo_connectblock call must happen here in v22, rather than in ConnectBlock()
+    komodo_connectblock(pindexNew,*(CBlock *)&blockConnecting);
+
     return true;
 }
 
@@ -3005,6 +3088,12 @@ static bool CheckBlockHeader(const CBlockHeader& block, BlockValidationState& st
     if (fCheckPOW && !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
 
+    if (g_rpc_node->chainman->ActiveChain().Height() > consensusParams.nAdaptivePoWActivationThreshold) {
+        if (block.GetBlockTime() > GetAdjustedTime() + 4) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "block-from-future", "CheckBlockHeader block from future");
+        }
+    }
+
     return true;
 }
 
@@ -3151,6 +3240,8 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
 {
     assert(pindexPrev != nullptr);
     const int nHeight = pindexPrev->nHeight + 1;
+    uint256 hash = block.GetHash();
+    int32_t notarized_height;
 
     // Check proof of work
     const Consensus::Params& consensusParams = params.GetConsensus();
@@ -3166,6 +3257,16 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         if (pcheckpoint && nHeight < pcheckpoint->nHeight) {
             LogPrintf("ERROR: %s: forked chain older than last checkpoint (height %d)\n", __func__, nHeight);
             return state.Invalid(BlockValidationResult::BLOCK_CHECKPOINT, "bad-fork-prior-to-checkpoint");
+        }
+        else if ( komodo_checkpoint(&notarized_height,(int32_t)nHeight,hash) < 0 )
+        {
+            CBlockIndex *heightblock = g_rpc_node->chainman->ActiveChain()[nHeight];
+            if ( heightblock != 0 && heightblock->GetBlockHash() == hash ) {
+                return true;
+            } else {
+                LogPrintf("ERROR: %s: forked chain %d older than last notarized (height %d) vs %d", __func__,nHeight, notarized_height);
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-fork-chain");
+            }
         }
     }
 
@@ -3254,14 +3355,14 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
         }
     }
 
-    // No witness data is allowed in blocks that don't commit to witness data, as this would otherwise leave room for spam
-    if (!fHaveWitness) {
-      for (const auto& tx : block.vtx) {
-            if (tx->HasWitness()) {
-                return state.Invalid(BlockValidationResult::BLOCK_MUTATED, "unexpected-witness", strprintf("%s : unexpected witness data found", __func__));
-            }
-        }
-    }
+//  // No witness data is allowed in blocks that don't commit to witness data, as this would otherwise leave room for spam
+//  if (!fHaveWitness) {
+//    for (const auto& tx : block.vtx) {
+//          if (tx->HasWitness()) {
+//              return state.Invalid(BlockValidationResult::BLOCK_MUTATED, "unexpected-witness", strprintf("%s : unexpected witness data found", __func__));
+//          }
+//    }
+//  }
 
     // After the coinbase witness reserved value and commitment are verified,
     // we can check if the block weight passes (before we've checked the

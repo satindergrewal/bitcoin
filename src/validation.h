@@ -59,6 +59,8 @@ struct PrecomputedTransactionData;
 struct LockPoints;
 struct AssumeutxoData;
 
+extern char ASSETCHAINS_SYMBOL[65];
+
 /** Default for -minrelaytxfee, minimum relay fee for transactions */
 static const unsigned int DEFAULT_MIN_RELAY_TX_FEE = 1000;
 /** Default for -limitancestorcount, max number of in-mempool ancestors */
@@ -105,6 +107,7 @@ enum class SynchronizationState {
     POST_INIT
 };
 
+extern std::unique_ptr<CCoinsViewCache> pcoinsTip;
 extern RecursiveMutex cs_main;
 typedef std::unordered_map<uint256, CBlockIndex*, BlockHasher> BlockMap;
 extern Mutex g_best_block_mutex;
@@ -153,6 +156,7 @@ void StopScriptCheckWorkerThreads();
  * @returns                    The tx if found, otherwise nullptr
  */
 CTransactionRef GetTransaction(const CBlockIndex* const block_index, const CTxMemPool* const mempool, const uint256& hash, const Consensus::Params& consensusParams, uint256& hashBlock);
+bool GetTransaction(const uint256& hash, CTransactionRef& tx, const Consensus::Params& params, uint256& hashBlock, bool fAllowSlow = false, CBlockIndex* blockIndex = nullptr);
 CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams);
 
 bool AbortNode(BlockValidationState& state, const std::string& strMessage, const bilingual_str& userMessage = bilingual_str{});
